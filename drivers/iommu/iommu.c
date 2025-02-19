@@ -101,7 +101,8 @@ static void iommu_release_device(struct device *dev);
 static int __iommu_attach_device(struct iommu_domain *domain,
 				 struct device *dev);
 static int __iommu_attach_group(struct iommu_domain *domain,
-				struct iommu_group *group);
+				struct iommu_group *group,
+				struct iommu_attach_handle *handle);
 static struct iommu_domain *__iommu_paging_domain_alloc_flags(struct device *dev,
 						       unsigned int type,
 						       unsigned int flags);
@@ -2094,7 +2095,7 @@ int iommu_attach_device(struct iommu_domain *domain, struct device *dev)
 	if (list_count_nodes(&group->devices) != 1)
 		goto out_unlock;
 
-	ret = __iommu_attach_group(domain, group);
+	ret = __iommu_attach_group(domain, group, NULL);
 
 out_unlock:
 	mutex_unlock(&group->mutex);
@@ -2162,9 +2163,12 @@ static void *iommu_make_pasid_entry(struct iommu_domain *domain,
 }
 
 static int __iommu_attach_group(struct iommu_domain *domain,
-				struct iommu_group *group)
+				struct iommu_group *group,
+				struct iommu_attach_handle *handle)
 {
 	struct device *dev;
+	void *pasid_entry;
+	int ret;
 
 	if (group->domain && group->domain != group->default_domain &&
 	    group->domain != group->blocking_domain)
@@ -2174,7 +2178,27 @@ static int __iommu_attach_group(struct iommu_domain *domain,
 	if (!dev_has_iommu(dev) || dev_iommu_ops(dev) != domain->owner)
 		return -EINVAL;
 
-	return __iommu_group_set_domain(group, domain);
+	pasid_entry = iommu_make_pasid_entry(domain, handle);
+
+	ret = xa_insert(&group->pasid_array,
+			IOMMU_NO_PASID, XA_ZERO_ENTRY, GFP_KERNEL);
+	if (ret)
+		return ret;
+
+	ret = __iommu_group_set_domain(group, domain);
+	if (ret)
+		return ret;
+
+	/*
+	 * The xa_insert() above reserved the memory, and the group->mutex is
+	 * held, this cannot fail. The new domain cannot be visible until the
+	 * operation succeeds as we cannot tolerate PRIs becoming concurrently
+	 * queued and then failing attach.
+	 */
+	WARN_ON(xa_is_err(
+		xa_store(&group->pasid_array,
+			 IOMMU_NO_PASID, pasid_entry, GFP_KERNEL)));
+	return 0;
 }
 
 /**
@@ -2194,7 +2218,7 @@ int iommu_attach_group(struct iommu_domain *domain, struct iommu_group *group)
 	int ret;
 
 	mutex_lock(&group->mutex);
-	ret = __iommu_attach_group(domain, group);
+	ret = __iommu_attach_group(domain, group, NULL);
 	mutex_unlock(&group->mutex);
 
 	return ret;
@@ -3513,37 +3537,14 @@ int iommu_attach_group_handle(struct iommu_domain *domain,
 			      struct iommu_group *group,
 			      struct iommu_attach_handle *handle)
 {
-	void *pasid_entry;
 	int ret;
 
 	if (!handle)
 		return -EINVAL;
 
-	pasid_entry = iommu_make_pasid_entry(domain, handle);
-
 	mutex_lock(&group->mutex);
-	ret = xa_insert(&group->pasid_array,
-			IOMMU_NO_PASID, XA_ZERO_ENTRY, GFP_KERNEL);
-	if (ret)
-		goto out_unlock;
+	ret = __iommu_attach_group(domain, group, handle);
 
-	ret = __iommu_attach_group(domain, group);
-	if (ret) {
-		xa_release(&group->pasid_array, IOMMU_NO_PASID);
-		goto out_unlock;
-	}
-
-	/*
-	 * The xa_insert() above reserved the memory, and the group->mutex is
-	 * held, this cannot fail. The new domain cannot be visible until the
-	 * operation succeeds as we cannot tolerate PRIs becoming concurrently
-	 * queued and then failing attach.
-	 */
-	WARN_ON(xa_is_err(
-		xa_store(&group->pasid_array,
-			 IOMMU_NO_PASID, pasid_entry, GFP_KERNEL)));
-
-out_unlock:
 	mutex_unlock(&group->mutex);
 	return ret;
 }
