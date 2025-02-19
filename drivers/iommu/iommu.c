@@ -117,17 +117,25 @@ static int __iommu_device_set_domain(struct iommu_group *group,
 				     unsigned int flags);
 static int __iommu_group_set_domain_internal(struct iommu_group *group,
 					     struct iommu_domain *new_domain,
+					     struct iommu_attach_handle *handle,
 					     unsigned int flags);
 static int __iommu_group_set_domain(struct iommu_group *group,
 				    struct iommu_domain *new_domain)
 {
-	return __iommu_group_set_domain_internal(group, new_domain, 0);
+	return __iommu_group_set_domain_internal(group, new_domain, NULL, 0);
 }
 static void __iommu_group_set_domain_nofail(struct iommu_group *group,
 					    struct iommu_domain *new_domain)
 {
 	WARN_ON(__iommu_group_set_domain_internal(
-		group, new_domain, IOMMU_SET_DOMAIN_MUST_SUCCEED));
+		group, new_domain, NULL, IOMMU_SET_DOMAIN_MUST_SUCCEED));
+}
+
+static int __iommu_group_set_domain_handle(struct iommu_group *group,
+					   struct iommu_domain *new_domain,
+					   struct iommu_attach_handle *handle)
+{
+	return __iommu_group_set_domain_internal(group, new_domain, handle, 0);
 }
 
 static int iommu_setup_default_domain(struct iommu_group *group,
@@ -512,6 +520,22 @@ static void iommu_deinit_device(struct device *dev)
 	dev->iommu_group = NULL;
 	module_put(ops->owner);
 	dev_iommu_free(dev);
+}
+
+static struct iommu_domain *pasid_entry_to_domain(void *pasid_entry)
+{
+	struct iommu_domain *domain;
+
+	if (xa_pointer_tag(pasid_entry) == IOMMU_PASID_ARRAY_HANDLE) {
+		struct iommu_attach_handle *handle;
+
+		handle = xa_untag_pointer(pasid_entry);
+		domain = handle->domain;
+	} else {
+		domain = xa_untag_pointer(pasid_entry);
+	}
+
+	return domain;
 }
 
 DEFINE_MUTEX(iommu_probe_device_lock);
@@ -2167,8 +2191,6 @@ static int __iommu_attach_group(struct iommu_domain *domain,
 				struct iommu_attach_handle *handle)
 {
 	struct device *dev;
-	void *pasid_entry;
-	int ret;
 
 	if (group->domain && group->domain != group->default_domain &&
 	    group->domain != group->blocking_domain)
@@ -2178,27 +2200,7 @@ static int __iommu_attach_group(struct iommu_domain *domain,
 	if (!dev_has_iommu(dev) || dev_iommu_ops(dev) != domain->owner)
 		return -EINVAL;
 
-	pasid_entry = iommu_make_pasid_entry(domain, handle);
-
-	ret = xa_insert(&group->pasid_array,
-			IOMMU_NO_PASID, XA_ZERO_ENTRY, GFP_KERNEL);
-	if (ret)
-		return ret;
-
-	ret = __iommu_group_set_domain(group, domain);
-	if (ret)
-		return ret;
-
-	/*
-	 * The xa_insert() above reserved the memory, and the group->mutex is
-	 * held, this cannot fail. The new domain cannot be visible until the
-	 * operation succeeds as we cannot tolerate PRIs becoming concurrently
-	 * queued and then failing attach.
-	 */
-	WARN_ON(xa_is_err(
-		xa_store(&group->pasid_array,
-			 IOMMU_NO_PASID, pasid_entry, GFP_KERNEL)));
-	return 0;
+	return __iommu_group_set_domain_handle(group, domain, handle);
 }
 
 /**
@@ -2286,10 +2288,12 @@ static int __iommu_device_set_domain(struct iommu_group *group,
  */
 static int __iommu_group_set_domain_internal(struct iommu_group *group,
 					     struct iommu_domain *new_domain,
+					     struct iommu_attach_handle *handle,
 					     unsigned int flags)
 {
 	struct group_device *last_gdev;
 	struct group_device *gdev;
+	void *curr, *pasid_entry;
 	int result;
 	int ret;
 
@@ -2300,6 +2304,15 @@ static int __iommu_group_set_domain_internal(struct iommu_group *group,
 
 	if (WARN_ON(!new_domain))
 		return -EINVAL;
+
+	pasid_entry = iommu_make_pasid_entry(new_domain, handle);
+	curr = xa_cmpxchg(&group->pasid_array, IOMMU_NO_PASID, NULL,
+			  XA_ZERO_ENTRY, GFP_KERNEL);
+	if (xa_is_err(curr))
+		return xa_err(curr);
+	if (curr == pasid_entry)
+		return 0;
+	WARN_ON(pasid_entry_to_domain(curr) != group->domain);
 
 	/*
 	 * Changing the domain is done by calling attach_dev() on the new
@@ -2326,6 +2339,8 @@ static int __iommu_group_set_domain_internal(struct iommu_group *group,
 		}
 	}
 	group->domain = new_domain;
+	WARN_ON(xa_is_err(xa_store(&group->pasid_array,
+				   IOMMU_NO_PASID, pasid_entry, GFP_KERNEL)));
 	return result;
 
 err_revert:
@@ -2987,7 +3002,7 @@ static int iommu_setup_default_domain(struct iommu_group *group,
 		 * in group->default_domain so it is freed after.
 		 */
 		ret = __iommu_group_set_domain_internal(
-			group, dom, IOMMU_SET_DOMAIN_MUST_SUCCEED);
+			group, dom, NULL, IOMMU_SET_DOMAIN_MUST_SUCCEED);
 		if (WARN_ON(ret))
 			goto out_free_old;
 	} else {
@@ -3018,7 +3033,7 @@ out_free_old:
 err_restore_domain:
 	if (old_dom)
 		__iommu_group_set_domain_internal(
-			group, old_dom, IOMMU_SET_DOMAIN_MUST_SUCCEED);
+			group, old_dom, NULL, IOMMU_SET_DOMAIN_MUST_SUCCEED);
 err_restore_def_domain:
 	if (old_dom) {
 		iommu_domain_free(dom);
@@ -3091,6 +3106,15 @@ out_unlock:
 	return ret ?: count;
 }
 
+static bool iommu_group_pasid_used(struct iommu_group *group)
+{
+	unsigned long start = IOMMU_NO_PASID;
+
+	lockdep_assert_held(&group->mutex);
+
+	return xa_find_after(&group->pasid_array, &start, UINT_MAX, XA_PRESENT);
+}
+
 /**
  * iommu_device_use_default_domain() - Device driver wants to handle device
  *                                     DMA through the kernel DMA API.
@@ -3111,7 +3135,7 @@ int iommu_device_use_default_domain(struct device *dev)
 	mutex_lock(&group->mutex);
 	if (group->owner_cnt) {
 		if (group->domain != group->default_domain || group->owner ||
-		    !xa_empty(&group->pasid_array)) {
+		    iommu_group_pasid_used(group)) {
 			ret = -EBUSY;
 			goto unlock_out;
 		}
@@ -3141,7 +3165,7 @@ void iommu_device_unuse_default_domain(struct device *dev)
 		return;
 
 	mutex_lock(&group->mutex);
-	if (!WARN_ON(!group->owner_cnt || !xa_empty(&group->pasid_array)))
+	if (!WARN_ON(!group->owner_cnt || iommu_group_pasid_used(group)))
 		group->owner_cnt--;
 
 	mutex_unlock(&group->mutex);
@@ -3177,7 +3201,7 @@ static int __iommu_take_dma_ownership(struct iommu_group *group, void *owner)
 	int ret;
 
 	if ((group->domain && group->domain != group->default_domain) ||
-	    !xa_empty(&group->pasid_array))
+	    iommu_group_pasid_used(group))
 		return -EBUSY;
 
 	ret = __iommu_group_alloc_blocking_domain(group);
@@ -3263,7 +3287,7 @@ EXPORT_SYMBOL_GPL(iommu_device_claim_dma_owner);
 static void __iommu_release_dma_ownership(struct iommu_group *group)
 {
 	if (WARN_ON(!group->owner_cnt || !group->owner ||
-		    !xa_empty(&group->pasid_array)))
+		    iommu_group_pasid_used(group)))
 		return;
 
 	group->owner_cnt = 0;
@@ -3585,34 +3609,15 @@ int iommu_replace_group_handle(struct iommu_group *group,
 			       struct iommu_domain *new_domain,
 			       struct iommu_attach_handle *handle)
 {
-	void *curr, *pasid_entry;
 	int ret;
 
 	if (!new_domain || !handle)
 		return -EINVAL;
 
-	pasid_entry = iommu_make_pasid_entry(new_domain, handle);
-
 	mutex_lock(&group->mutex);
-	ret = xa_reserve(&group->pasid_array, IOMMU_NO_PASID, GFP_KERNEL);
-	if (ret)
-		goto err_unlock;
-
-	ret = __iommu_group_set_domain(group, new_domain);
-	if (ret)
-		goto err_release;
-
-	curr = xa_store(&group->pasid_array,
-			IOMMU_NO_PASID, pasid_entry, GFP_KERNEL);
-	WARN_ON(xa_is_err(curr));
-
+	ret = __iommu_group_set_domain_handle(group, new_domain, handle);
 	mutex_unlock(&group->mutex);
 
-	return 0;
-err_release:
-	xa_release(&group->pasid_array, IOMMU_NO_PASID);
-err_unlock:
-	mutex_unlock(&group->mutex);
 	return ret;
 }
 EXPORT_SYMBOL_NS_GPL(iommu_replace_group_handle, "IOMMUFD_INTERNAL");
