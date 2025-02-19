@@ -2154,6 +2154,10 @@ out_unlock:
 }
 EXPORT_SYMBOL_GPL(iommu_detach_device);
 
+/*
+ * It's better used when the group->mutex is held. If not, caller needs
+ * to ensure no race with domain attach.
+ */
 struct iommu_domain *iommu_get_domain_for_dev(struct device *dev)
 {
 	/* Caller must be a probed driver on dev */
