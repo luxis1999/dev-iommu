@@ -28,6 +28,7 @@ enum {
 	IOMMU_TEST_OP_PASID_REPLACE,
 	IOMMU_TEST_OP_PASID_DETACH,
 	IOMMU_TEST_OP_PASID_CHECK_DOMAIN,
+	IOMMU_TEST_OP_MIX_REPLACE_HANDLE,
 };
 
 enum {
@@ -176,6 +177,11 @@ struct iommu_test_cmd {
 			__u64 out_result_ptr;
 			/* @id is stdev_id for IOMMU_TEST_OP_HWPT_GET_DOMAIN */
 		} pasid_check;
+		struct {
+			__u32 pasid;
+			__u32 pt_id;
+			/* @id is stdev_id for IOMMU_TEST_OP_PASID_ATTACH */
+		} mix_replace_handle;
 	};
 	__u32 last;
 };

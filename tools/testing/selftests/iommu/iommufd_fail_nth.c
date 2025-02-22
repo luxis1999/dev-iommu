@@ -717,6 +717,9 @@ TEST_FAIL_NTH(basic_fail_nth, device)
 	if (_test_cmd_pasid_detach(self->fd, self->stdev_id, self->pasid))
 		return -1;
 
+	if (_test_cmd_mixed_replace(self->fd, self->stdev_id, 100, hwpt_id))
+		return -1;
+
 	self->pasid = 0;
 
 	return 0;

@@ -1776,6 +1776,150 @@ out_put_dev:
 	return rc;
 }
 
+/* A set of tests to replace pasid or rid with handle or non handle */
+static int iommufd_test_mixed_pasid_replace(struct iommu_domain *domain,
+					    struct iommu_group *group,
+					    struct device *dev, ioasid_t pasid)
+{
+	struct iommu_attach_handle *handle;
+	int ret;
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle) {
+		return -ENOMEM;
+	}
+
+	ret = iommu_replace_device_pasid_handle(domain, dev, pasid, handle);
+	if (ret != -EINVAL)
+		goto out_free;
+
+	ret = iommu_attach_device_pasid(domain, dev, pasid);
+	if (ret)
+		goto out_free;
+
+	if (PTR_ERR(iommu_attach_handle_get(group, pasid, 0)) != -ENOENT) {
+		ret = -ENODEV;
+		goto out_detach;
+	}
+
+	ret = iommu_replace_device_pasid_handle(domain, dev, pasid, handle);
+	if (ret)
+		goto out_detach;
+
+	if (handle != iommu_attach_handle_get(group, pasid, 0)) {
+		ret = -ENOENT;
+		goto out_detach;
+	}
+
+	ret = iommu_replace_device_pasid_handle(domain, dev, pasid, handle);
+	if (ret)
+		goto out_detach;
+
+	if (handle != iommu_attach_handle_get(group, pasid, 0)) {
+		ret = -ENOENT;
+		goto out_detach;
+	}
+
+out_detach:
+	iommu_detach_device_pasid(domain, dev, pasid);
+out_free:
+	kfree(handle);
+	return ret;
+}
+
+static int iommufd_test_mixed_group_replace(struct iommu_domain *domain,
+					    struct iommu_group *group,
+					    struct device *dev)
+{
+	struct iommu_domain *old_domain = iommu_get_domain_for_dev(dev);
+	struct iommu_attach_handle *handle, *old_handle;
+	int ret;
+
+	old_handle = iommu_attach_handle_get(group, IOMMU_NO_PASID, 0);
+	if (IS_ERR(old_handle))
+		return PTR_ERR(old_handle);
+
+	iommu_detach_group(domain, group);
+
+	handle = kzalloc(sizeof(*handle), GFP_KERNEL);
+	if (!handle) {
+		return -ENOMEM;
+	}
+
+	ret = iommu_attach_group(domain, group);
+	if (ret)
+		goto out_free;
+
+	ret = iommu_replace_group_handle(group, domain, handle);
+	if (ret)
+		goto out_free;
+
+	if (iommu_get_domain_for_dev(dev) != domain) {
+		ret = -ENODEV;
+		goto out_free;
+	}
+
+	ret = iommu_replace_group_handle(group, domain, handle);
+	if (ret)
+		goto out_free;
+
+	ret = iommu_replace_group_handle(group, old_domain, old_handle);
+	if (ret)
+		goto out_free;
+
+out_free:
+	kfree(handle);
+	return ret;
+}
+
+static int iommufd_test_mixed_handle_replace(struct iommufd_ucmd *ucmd,
+					     unsigned int device_id,
+					     ioasid_t pasid, u32 pt_id)
+{
+	struct iommufd_hw_pagetable *hwpt;
+	struct iommu_domain *domain;
+	struct iommu_group *group;
+	struct selftest_obj *sobj;
+	struct device *dev;
+	int rc;
+
+	sobj = iommufd_test_get_self_test_device(ucmd->ictx, device_id);
+	if (IS_ERR(sobj))
+		return PTR_ERR(sobj);
+
+	dev = sobj->idev.idev->dev;
+
+	group = iommu_group_get(dev);
+	if (!group) {
+		rc = -EINVAL;
+		goto out_dev_obj;
+	}
+
+	hwpt = iommufd_get_hwpt(ucmd, pt_id);
+	if (IS_ERR(hwpt)) {
+		rc = PTR_ERR(hwpt);
+		goto out_put_group;
+	}
+
+	domain = hwpt->domain;
+
+	rc = iommufd_test_mixed_pasid_replace(domain, group, dev, pasid);
+	if (rc)
+		goto out_put_hwpt;
+
+	rc = iommufd_test_mixed_group_replace(domain, group, dev);
+	if (rc)
+		goto out_put_hwpt;
+
+out_put_hwpt:
+	iommufd_put_object(ucmd->ictx, &hwpt->obj);
+out_put_group:
+	iommu_group_put(group);
+out_dev_obj:
+	iommufd_put_object(ucmd->ictx, &sobj->obj);
+	return rc;
+}
+
 void iommufd_selftest_destroy(struct iommufd_object *obj)
 {
 	struct selftest_obj *sobj = to_selftest_obj(obj);
@@ -1865,6 +2009,11 @@ int iommufd_test(struct iommufd_ucmd *ucmd)
 		return iommufd_test_pasid_detach(ucmd, cmd);
 	case IOMMU_TEST_OP_PASID_CHECK_DOMAIN:
 		return iommufd_test_pasid_check_domain(ucmd, cmd);
+	case IOMMU_TEST_OP_MIX_REPLACE_HANDLE:
+		return iommufd_test_mixed_handle_replace(
+			ucmd, cmd->id,
+			cmd->mix_replace_handle.pasid,
+			cmd->mix_replace_handle.pt_id);
 	default:
 		return -EOPNOTSUPP;
 	}

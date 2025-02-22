@@ -1038,3 +1038,24 @@ static int test_cmd_pasid_check_domain(int fd, __u32 stdev_id, __u32 pasid,
 	return ioctl(fd, _IOMMU_TEST_CMD(IOMMU_TEST_OP_PASID_CHECK_DOMAIN),
 		     &test_pasid_check);
 }
+
+static int _test_cmd_mixed_replace(int fd, __u32 stdev_id, __u32 pasid,
+				   __u32 pt_id)
+{
+	struct iommu_test_cmd test_mixed_replace = {
+		.size = sizeof(test_mixed_replace),
+		.op = IOMMU_TEST_OP_MIX_REPLACE_HANDLE,
+		.id = stdev_id,
+		.mix_replace_handle = {
+			.pasid = pasid,
+			.pt_id = pt_id,
+		},
+	};
+
+	return ioctl(fd, _IOMMU_TEST_CMD(IOMMU_TEST_OP_MIX_REPLACE_HANDLE),
+		     &test_mixed_replace);
+}
+
+#define test_cmd_mixed_replace(pasid, hwpt_id)                         \
+	ASSERT_EQ(0, _test_cmd_mixed_replace(self->fd, self->stdev_id, \
+					     pasid, hwpt_id));

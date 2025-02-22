@@ -3293,6 +3293,8 @@ TEST_F(iommufd_device_pasid, pasid_attach)
 	close(fault_fd);
 	test_ioctl_destroy(fault_id);
 
+	test_cmd_mixed_replace(4096, s2_hwpt_id);
+
 	/* Detach the s2_hwpt_id from RID */
 	test_cmd_mock_domain_replace(self->stdev_id, self->ioas_id);
 
